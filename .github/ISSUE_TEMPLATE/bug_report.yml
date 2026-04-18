@@ -1,0 +1,74 @@
+name: Bug Report
+description: Report something that isn't working correctly
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to fill out this bug report!
+
+        **Important**: Search existing issues first — your bug may already be reported.
+  - type: dropdown
+    id: repo
+    attributes:
+      label: Repository
+      description: Which Crontinel package is affected?
+      options:
+        - crontinel/app (SaaS application)
+        - crontinel/php (PHP core library)
+        - crontinel/laravel (Laravel package)
+        - crontinel/node (Node.js SDK)
+        - crontinel/python (Python SDK)
+        - crontinel/go (Go SDK)
+        - crontinel/rust (Rust SDK)
+        - crontinel/cli (CLI tool)
+        - crontinel/mcp-server (MCP server)
+        - crontinel/landing (Marketing site)
+        - crontinel/docs (Documentation)
+        - Not sure / Multiple repos
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: Bug Description
+      description: A clear and concise description of the problem
+      placeholder: Describe what went wrong...
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to Reproduce
+      description: How can we reproduce this issue?
+      placeholder: |
+        1. Go to '...'
+        2. Click on '...'
+        3. See error
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Behavior
+      description: What did you expect to happen?
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual Behavior
+      description: What actually happens instead?
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: "OS, PHP/Node/Python version, framework version, etc."
+      placeholder: "Ubuntu 22.04, PHP 8.3, Laravel 11"
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant Logs
+      description: Any error messages or stack traces (use ``` to format)

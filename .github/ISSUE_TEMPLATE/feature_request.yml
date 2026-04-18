@@ -1,0 +1,56 @@
+name: Feature Request
+description: Suggest a new feature or improvement
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for your feature request!
+
+        **Important**: Search existing issues and pull requests first.
+  - type: dropdown
+    id: repo
+    attributes:
+      label: Repository
+      description: Which Crontinel package should this feature target?
+      options:
+        - crontinel/app (SaaS application)
+        - crontinel/php (PHP core library)
+        - crontinel/laravel (Laravel package)
+        - crontinel/node (Node.js SDK)
+        - crontinel/python (Python SDK)
+        - crontinel/go (Go SDK)
+        - crontinel/rust (Rust SDK)
+        - crontinel/cli (CLI tool)
+        - crontinel/mcp-server (MCP server)
+        - crontinel/landing (Marketing site)
+        - crontinel/docs (Documentation)
+        - Not sure / Multiple repos
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What problem does this solve?
+      placeholder: "I want to monitor X but Crontinel doesn't support it..."
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed Solution
+      description: How should it work?
+      placeholder: "Add support for X that does Y..."
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives Considered
+      description: Any alternative approaches you considered?
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional Context
+      description: Any other context, mockups, or examples?
