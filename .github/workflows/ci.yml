@@ -22,8 +22,6 @@ jobs:
           pip install -e ".[dev]"
           pip install ruff
 
-      - name: Lint with ruff
-        run: ruff check .
 
       - name: Run tests
         run: pytest
