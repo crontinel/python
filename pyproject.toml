@@ -12,7 +12,7 @@ Repository = "https://github.com/crontinel/python"
 Homepage = "https://crontinel.com"
 
 [project.optional-dependencies]
-dev = ["pytest", "pytest-asyncio", "httpx"]
+dev = ["pytest", "pytest-asyncio", "httpx", "requests"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
