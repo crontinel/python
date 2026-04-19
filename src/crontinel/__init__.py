@@ -40,8 +40,6 @@ class Crontinel:
         self.sync = sync
 
     def _request(self, method: str, params: dict[str, Any]) -> Any:
-        import json
-
         payload = {
             "jsonrpc": "2.0",
             "id": int(time.time() * 1000),
