@@ -22,6 +22,11 @@ class TestCrontinel:
         c = Crontinel(api_key="test")
         assert c.api_url == "https://app.crontinel.com"
 
+    def test_api_url_from_env(self, monkeypatch):
+        monkeypatch.setenv("CRONTINEL_API_URL", "https://custom.example.com/")
+        c = Crontinel(api_key="test")
+        assert c.api_url == "https://custom.example.com"
+
     def test_custom_api_url(self):
         c = Crontinel(api_key="test", api_url="https://custom.example.com")
         assert c.api_url == "https://custom.example.com"
@@ -51,6 +56,15 @@ class TestCrontinel:
         assert body["params"]["duration_ms"] == 1500
         assert body["params"]["exit_code"] == 0
         assert body["params"]["app"] == "python"
+
+    def test_schedule_run_uses_api_url_and_auth_header(self, mock_requests_post):
+        c = Crontinel(api_key="ctn_test_key_123", api_url="https://custom.example.com/")
+        c.schedule_run(command="heartbeat:ping", duration_ms=50)
+
+        call_args = mock_requests_post.call_args
+        assert call_args.args[0] == "https://custom.example.com/api/mcp"
+        assert call_args.kwargs["headers"]["Authorization"] == "Bearer ctn_test_key_123"
+        assert call_args.kwargs["headers"]["User-Agent"].startswith("crontinel-python:")
 
     def test_schedule_run_default_exit_code(self, mock_requests_post):
         c = Crontinel(api_key="ctn_test_key_123")
