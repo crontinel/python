@@ -17,6 +17,8 @@ pip install "crontinel[httpx]"
 ## Quick Start
 
 ```python
+import os
+
 from crontinel import Crontinel
 
 client = Crontinel(
@@ -54,9 +56,19 @@ client.event(
 | `CRONTINEL_API_KEY` | — | Your Crontinel API key (required) |
 | `CRONTINEL_API_URL` | `https://app.crontinel.com` | Crontinel SaaS or self-hosted endpoint |
 
-## `monitor_schedule` helper
+## Cron / heartbeat submission
 
-Wrap any function and automatically report its outcome:
+Use `schedule_run()` when your cron or heartbeat job finishes and you want to submit one monitoring event to Crontinel:
+
+```python
+client.schedule_run(
+    command="reports:generate",
+    duration_ms=2340,
+    exit_code=0,
+)
+```
+
+If you want the SDK to measure and submit the run automatically, use `monitor_schedule()`:
 
 ```python
 result, duration_ms, exit_code = client.monitor_schedule(

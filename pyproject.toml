@@ -1,18 +1,23 @@
 [project]
 name = "crontinel"
-version = "0.1.0"
+version = "0.2.0"
 description = "Crontinel monitoring SDK for Python applications"
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
 authors = [{ name = "Harun R Rayhan" }]
 
+[project.scripts]
+crontinel = "crontinel.__main__:main"
+
 [project.urls]
 Repository = "https://github.com/crontinel/python"
 Homepage = "https://crontinel.com"
 
 [project.optional-dependencies]
-dev = ["pytest", "pytest-asyncio", "httpx", "requests"]
+dev = ["pytest", "pytest-asyncio"]
+httpx = ["httpx"]
+requests = ["requests"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
