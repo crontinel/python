@@ -29,6 +29,7 @@ HEARTBEAT_PATH = "/api/v1/agent/heartbeat"
 HEARTBEAT_INTERVAL = 60
 MAX_RECONNECT_DELAY = 60
 STREAM_SELECT_TIMEOUT = 1  # seconds
+MAX_COMMAND_OUTPUT = 1_048_576  # 1 MB max output per command
 DEFAULT_API_URL = "https://app.crontinel.com"
 
 
@@ -71,6 +72,7 @@ class Agent:
         self.last_heartbeat_at = 0.0
         self.started_at = 0.0
         self.reconnect_attempt = 0
+        self._sse_readahead = ""
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
@@ -166,6 +168,9 @@ class Agent:
             )
             exit_code = result.returncode
             output = result.stdout + result.stderr
+            if len(output) > MAX_COMMAND_OUTPUT:
+                output = output[:MAX_COMMAND_OUTPUT]
+                self._log(f"Command [{command_id}] output truncated to {MAX_COMMAND_OUTPUT} bytes")
             status = "completed" if exit_code == 0 else "failed"
         except subprocess.TimeoutExpired:
             exit_code = -1
@@ -285,40 +290,43 @@ class Agent:
         """
         Read and validate the HTTP response status line and headers.
 
+        Manually reads from the raw socket (no ``makefile`` wrapper)
+        so SSE body data is not lost in a BufferedReader buffer.
+        Any data after the ``\\r\\n\\r\\n`` header boundary is saved
+        in ``self._sse_readahead`` and fed to the parser first.
+
         Returns ``True`` if the status is 2xx.
         """
-        rfile = sock.makefile("rb")
-        try:
-            status_line = rfile.readline().decode().strip()
-        except OSError as exc:
-            self._log(f"Connection closed while reading response: {exc}")
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            try:
+                chunk = sock.recv(4096)
+            except OSError as exc:
+                self._log(f"Connection closed while reading response: {exc}")
+                return False
+            if not chunk:
+                self._log("Connection closed while reading response.")
+                return False
+            buf += chunk
+
+        # Split at the header/body boundary
+        header_bytes, extra = buf.split(b"\r\n\r\n", 1)
+        header_text = header_bytes.decode("utf-8", errors="replace")
+
+        # Save any extra data for the SSE parser
+        if extra:
+            self._sse_readahead = extra.decode("utf-8", errors="replace")
+
+        lines = header_text.split("\r\n")
+        if not lines:
+            self._log("Empty response headers.")
             return False
 
-        if not status_line:
-            self._log("Connection closed while reading response.")
-            return False
-
+        status_line = lines[0].strip()
         parts = status_line.split(None, 2)
         if len(parts) < 2 or not parts[1].startswith("2"):
             self._log(f"Unexpected response: {status_line}")
-            # consume remaining headers
-            while True:
-                try:
-                    line = rfile.readline().decode().strip()
-                    if not line:
-                        break
-                except OSError:
-                    break
             return False
-
-        # Consume remaining headers until blank line
-        while True:
-            try:
-                line = rfile.readline().decode().strip()
-                if not line:
-                    break
-            except OSError:
-                break
 
         return True
 
@@ -331,13 +339,16 @@ class Agent:
         """
         sock.setblocking(False)
 
+        # Feed any readahead from the header parsing phase
+        if self._sse_readahead:
+            self.feed_sse_data(self._sse_readahead)
+            self._sse_readahead = ""
+
         while self.running:
             ready = select.select([sock], [], [], STREAM_SELECT_TIMEOUT)
 
             if not ready[0]:
-                # Timeout — check heartbeats and signals
-                signal.signal(signal.SIGINT, signal.SIG_DFL)
-                signal.signal(signal.SIGTERM, signal.SIG_DFL)
+                # Timeout — check heartbeats
                 self._check_heartbeat()
                 continue
 
@@ -394,6 +405,7 @@ class Agent:
     def _reset_sse_parser(self) -> None:
         self.sse_buffer = ""
         self.current_event = None
+        self._sse_readahead = ""
 
     # ── Heartbeat ──────────────────────────────────────────────────────────────
 
@@ -467,19 +479,25 @@ class Agent:
                 sock = ctx.wrap_socket(sock, server_hostname=host)
 
             sock.sendall(request)
-            # Read response (just consume it, we only care about status)
+            # Read response (consume headers and body)
             rfile = sock.makefile("rb")
             status_line = rfile.readline().decode().strip()
-            if status_line and not any(
-                s in status_line for s in ["200", "201", "202", "204"]
-            ):
+            status_code = 0
+            if status_line:
+                parts = status_line.split(None, 2)
+                if len(parts) >= 2:
+                    try:
+                        status_code = int(parts[1])
+                    except ValueError:
+                        pass
+            if status_code and status_code not in (200, 201, 202, 204):
                 log.warning(
                     "HTTP POST %s returned %s", path, status_line
                 )
             # Drain the rest
             while rfile.readline():
                 pass
-        except OSError as exc:
+        except (ssl.SSLError, OSError) as exc:
             log.warning("HTTP POST %s error: %s", path, exc)
         finally:
             sock.close()

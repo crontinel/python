@@ -9,7 +9,7 @@ import os
 import time
 from typing import Any, Callable, TypeVar
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 DEFAULT_API_URL = "https://app.crontinel.com"
 
