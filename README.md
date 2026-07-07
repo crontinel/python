@@ -10,6 +10,11 @@ pip install crontinel
 pip install "crontinel[httpx]"
 ```
 
+> **Note:** The package is not yet available on PyPI. Install directly from GitHub:
+> ```bash
+> pip install git+https://github.com/crontinel/python.git
+> ```
+
 ## Requirements
 
 - Python 3.9+
