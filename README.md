@@ -5,9 +5,10 @@ Crontinel monitoring SDK for Python applications. Send cron, queue, and job moni
 ## Install
 
 ```bash
-pip install crontinel
+# Install directly from GitHub (PyPI publishing pending)
+pip install git+https://github.com/crontinel/python.git
 # or with httpx for async support:
-pip install "crontinel[httpx]"
+pip install "crontinel[httpx] @ git+https://github.com/crontinel/python.git"
 ```
 
 ## Requirements

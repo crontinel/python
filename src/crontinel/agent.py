@@ -1,9 +1,9 @@
 """
 Crontinel Agent — remote command execution daemon.
 
-Connects to app.crontinel.com via SSE to receive and execute commands,
-reports results via HTTP POST, sends heartbeats every 60s, and
-automatically reconnects with exponential backoff on disconnect.
+Polls app.crontinel.com via HTTP for pending commands, executes them,
+and reports results. Uses HTTP polling (registration -> poll -> execute -> report)
+instead of SSE for simplicity and portability.
 """
 
 from __future__ import annotations
@@ -11,7 +11,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import select
 import signal
 import socket
 import ssl
@@ -19,34 +18,28 @@ import subprocess
 import time
 import urllib.parse
 from datetime import datetime, timezone
-from typing import Callable
+from typing import Any, Callable
 
 log = logging.getLogger(__name__)
 
-SSE_PATH = "/api/v1/agent/stream"
-COMMAND_RESULT_PATH = "/api/v1/agent/command/{command_id}/result"
-HEARTBEAT_PATH = "/api/v1/agent/heartbeat"
-HEARTBEAT_INTERVAL = 60
-MAX_RECONNECT_DELAY = 60
-STREAM_SELECT_TIMEOUT = 1  # seconds
+REGISTER_PATH = "/v1/agents/register"
+COMMANDS_PATH = "/v1/agents/{app_id}/commands"
+RESULT_PATH = "/v1/ingest/agent-result"
+HEARTBEAT_PATH = "/v1/agents/heartbeat"
+
+POLL_INTERVAL_S = 5
+HEARTBEAT_INTERVAL_S = 60
+MAX_RECONNECT_DELAY_S = 60
+HTTP_TIMEOUT_S = 15
 MAX_COMMAND_OUTPUT = 1_048_576  # 1 MB max output per command
 DEFAULT_API_URL = "https://app.crontinel.com"
-
-
-class SseEvent:
-    """A parsed Server-Sent Event (event type, data, optional id)."""
-
-    def __init__(self) -> None:
-        self.event: str = ""
-        self.data: str = ""
-        self.id: str = ""
 
 
 class Agent:
     """
     Crontinel agent daemon.
 
-    Connects to the SaaS SSE stream, listens for ``command`` events,
+    Registers with the cloud, then polls for pending commands via HTTP,
     executes them as subprocesses, and reports results back.
     """
 
@@ -54,6 +47,7 @@ class Agent:
         self,
         api_key: str | None = None,
         api_url: str | None = None,
+        app_id: str | None = None,
         output_writer: Callable[[str], None] | None = None,
     ) -> None:
         self.api_key = api_key or os.environ.get("CRONTINEL_API_KEY", "")
@@ -62,17 +56,21 @@ class Agent:
                 "CRONTINEL_API_KEY is not set. Set it in your environment "
                 "or pass it to the constructor."
             )
+        self.app_id = app_id or os.environ.get("CRONTINEL_APP_ID", "")
+        if not self.app_id:
+            raise ValueError(
+                "CRONTINEL_APP_ID is not set. Set it in your environment "
+                "or pass it to the constructor."
+            )
+
         base_url = (api_url or os.environ.get("CRONTINEL_API_URL") or DEFAULT_API_URL).rstrip("/")
         self.api_url = base_url.rstrip("/api")  # strip trailing /api if present
         self.output_writer = output_writer or (lambda msg: print(msg))
 
         self.running = True
-        self.sse_buffer = ""
-        self.current_event: SseEvent | None = None
-        self.last_heartbeat_at = 0.0
-        self.started_at = 0.0
+        self.last_heartbeat_at = time.time()
+        self.started_at = time.time()
         self.reconnect_attempt = 0
-        self._sse_readahead = ""
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
@@ -81,77 +79,110 @@ class Agent:
         self.started_at = time.time()
         self.last_heartbeat_at = self.started_at
         self._install_signal_handlers()
-        self._log("Agent starting...")
+
+        self._log(f"Agent starting...")
+        self._log(f"Agent ID: {self._agent_id()}")
+        self._log(f"App ID: {self.app_id}")
+        self._log(f"API URL: {self.api_url}")
+
+        # Register with the cloud on startup
+        self.register()
+
+        self._log("Agent registered. Starting poll loop...")
 
         while self.running:
             try:
-                self._connect_and_listen()
+                self._poll_once()
+                self.reconnect_attempt = 0
             except Exception as exc:
-                log.error("Connection error: %s", exc)
-                self._log(f"Connection error: {exc}")
+                log.error("Poll error: %s", exc)
+                self._log(f"Poll error: {exc}")
 
             if not self.running:
                 break
 
-            self.reconnect_attempt += 1
-            delay = min(
-                (1 << min(self.reconnect_attempt - 1, 5))
-                if self.reconnect_attempt > 1
-                else 1,
-                MAX_RECONNECT_DELAY,
-            )
-            self._log(
-                f"Reconnecting in {delay}s (attempt {self.reconnect_attempt})..."
-            )
-            time.sleep(delay)
+            # Throttle loop
+            self._sleep(POLL_INTERVAL_S)
 
         self._log("Agent stopped.")
 
     def is_configured(self) -> bool:
-        """Whether the agent has an API key configured."""
-        return bool(self.api_key)
+        """Whether the agent has an API key and app ID configured."""
+        return bool(self.api_key) and bool(self.app_id)
 
-    def feed_sse_data(self, data: str) -> None:
-        """
-        Feed raw SSE data into the parser (useful for testing).
+    # ── Registration ───────────────────────────────────────────────────────────
 
-        Processes line-by-line and dispatches complete events.
-        """
-        self.sse_buffer += data
-        while "\n" in self.sse_buffer:
-            line, self.sse_buffer = self.sse_buffer.split("\n", 1)
-            self._feed_line(line.rstrip("\r"))
-
-    def handle_command_event(self, json_data: str) -> None:
-        """
-        Parse and execute a command event payload.
-        Public so tests can call it directly without going through SSE.
-        """
+    def register(self) -> None:
+        """Register this agent with the Crontinel cloud."""
         try:
-            payload = json.loads(json_data)
-        except json.JSONDecodeError:
-            log.warning("Malformed command event: %s", json_data)
-            self._log("Malformed command event received.")
+            body = {
+                "agent_id": self._agent_id(),
+                "agent_name": self._agent_name(),
+                "metadata": {
+                    "python_version": os.environ.get("PYTHON_VERSION", ""),
+                    "platform": os.name,
+                },
+            }
+            result = self._http_post(self.api_url + REGISTER_PATH, json_body=body)
+            if result is not None:
+                self._log(f"Registered: id={result.get('id', 'unknown')}")
+            else:
+                self._log("Registration response was empty (continuing anyway)")
+        except Exception as exc:
+            self._log(f"Registration error: {exc} (continuing anyway)")
+
+    # ── Poll Loop ──────────────────────────────────────────────────────────────
+
+    def _poll_once(self) -> None:
+        """Single poll iteration: heartbeat check + fetch + execute."""
+        self._check_heartbeat()
+
+        commands = self._fetch_commands()
+
+        if not commands:
             return
 
-        command_id = payload.get("command_id")
-        command_str = payload.get("command")
-        if not command_id or not command_str:
-            log.warning(
-                "Malformed command event: missing command_id or command field"
-            )
-            self._log(
-                "Malformed command event received (missing required fields)."
-            )
-            return
+        self._log(f"Received {len(commands)} command(s)")
 
-        env_overrides = payload.get("env", {})
-        cmd_timeout = payload.get("timeout", 300)
+        for cmd in commands:
+            if not self.running:
+                break
+            self._execute_and_report(cmd)
 
-        self._log(f"Executing command [{command_id}]: {command_str}")
+    def _fetch_commands(self) -> list[dict[str, Any]]:
+        """Poll the cloud for pending commands."""
+        url = f"{self.api_url}{COMMANDS_PATH.format(app_id=self.app_id)}"
+        try:
+            data = self._http_get(url)
+            if data is None:
+                return []
+            return data.get("data", [])
+        except Exception as exc:
+            self._log(f"Commands fetch error: {exc}")
+            return []
+
+    # ── Execute + Report ───────────────────────────────────────────────────────
+
+    def _execute_and_report(self, cmd: dict[str, Any]) -> None:
+        """Execute a command and report the result."""
+        trigger_id = str(cmd["id"])
+        command_str = cmd["command"]
+
+        self._log(f"Executing [{trigger_id}]: {command_str}")
 
         started_at = datetime.now(timezone.utc)
-        start_micro = time.time()
+        start_ms = int(time.time() * 1000)
+
+        exit_code = 0
+        output = ""
+        status = "completed"
+        error_message: str | None = None
+
+        # Acknowledge receipt first
+        self._report_result(trigger_id=trigger_id, status="acknowledged")
+
+        env_overrides = cmd.get("payload") or {}
+        cmd_timeout = 300
 
         env = None
         if env_overrides:
@@ -170,252 +201,82 @@ class Agent:
             output = result.stdout + result.stderr
             if len(output) > MAX_COMMAND_OUTPUT:
                 output = output[:MAX_COMMAND_OUTPUT]
-                self._log(f"Command [{command_id}] output truncated to {MAX_COMMAND_OUTPUT} bytes")
+                self._log(f"Command [{trigger_id}] output truncated to {MAX_COMMAND_OUTPUT} bytes")
             status = "completed" if exit_code == 0 else "failed"
         except subprocess.TimeoutExpired:
             exit_code = -1
             output = f"Command timed out after {cmd_timeout}s"
             status = "failed"
-            self._log(f"Command [{command_id}] timed out after {cmd_timeout}s")
+            error_message = f"Timed out after {cmd_timeout}s"
+            self._log(f"Command [{trigger_id}] timed out after {cmd_timeout}s")
         except Exception as exc:
             exit_code = -1
             output = str(exc)
             status = "failed"
-            self._log(f"Command [{command_id}] error: {exc}")
+            error_message = str(exc)
+            self._log(f"Command [{trigger_id}] error: {exc}")
 
         finished_at = datetime.now(timezone.utc)
-        duration_ms = int((time.time() - start_micro) * 1000)
+        duration_ms = int(time.time() * 1000) - start_ms
 
         self._log(
-            f"Command [{command_id}] finished: {status} "
-            f"({duration_ms}ms, exit {exit_code})"
+            f"[{trigger_id}] {status} ({duration_ms}ms, exit {exit_code})"
         )
 
-        self._report_command_result(
-            command_id=command_id,
+        self._report_result(
+            trigger_id=trigger_id,
             status=status,
             exit_code=exit_code,
             output=output,
+            error_message=error_message,
             started_at=started_at.isoformat(),
             finished_at=finished_at.isoformat(),
             duration_ms=duration_ms,
         )
 
-    # ── Connect / Listen ───────────────────────────────────────────────────────
-
-    def _connect_and_listen(self) -> None:
-        """Open a raw HTTPS connection to the SSE endpoint and read the stream."""
-        self._reset_sse_parser()
-        self.reconnect_attempt = 0
-
-        url = f"{self.api_url}{SSE_PATH}"
-        self._log(f"Connecting to {url}...")
-
-        sock = self._open_sse_connection(url)
-        if sock is None:
-            return
-
-        if not self._read_response_headers(sock):
-            sock.close()
-            return
-
-        self._log("Connected. Listening for commands...")
-
-        try:
-            self._read_sse_stream(sock)
-        finally:
-            sock.close()
-
-        self._log("Disconnected.")
-
-    def _open_sse_connection(self, url: str) -> socket.socket | None:
-        """
-        Open a TCP/TLS socket to the SSE endpoint and send the HTTP request.
-
-        Returns the connected socket, or ``None`` on failure.
-        """
-        parsed = urllib.parse.urlparse(url)
-        host = parsed.hostname
-        if not host:
-            log.error("Crontinel Agent: invalid SSE URL — no hostname")
-            return None
-
-        scheme = parsed.scheme or "https"
-        port = parsed.port or (443 if scheme == "https" else 80)
-        path = parsed.path or "/"
-        if parsed.query:
-            path += "?" + parsed.query
+    def _report_result(
+        self,
+        trigger_id: str,
+        status: str,
+        exit_code: int | None = None,
+        output: str | None = None,
+        error_message: str | None = None,
+        started_at: str | None = None,
+        finished_at: str | None = None,
+        duration_ms: int | None = None,
+    ) -> None:
+        """Report a command execution result to the cloud."""
+        payload: dict[str, Any] = {
+            "trigger_id": trigger_id,
+            "status": status,
+        }
+        if exit_code is not None:
+            payload["exit_code"] = exit_code
+        if output is not None:
+            payload["output"] = output
+        if error_message is not None:
+            payload["error_message"] = error_message
+        if started_at is not None:
+            payload["started_at"] = started_at
+        if finished_at is not None:
+            payload["finished_at"] = finished_at
+        if duration_ms is not None:
+            payload["duration_ms"] = duration_ms
 
         try:
-            sock = socket.create_connection((host, port), timeout=30)
-        except OSError as exc:
-            log.error("Crontinel Agent: socket connect failed: %s", exc)
-            self._log(f"Socket connect failed: {exc}")
-            return None
-
-        if scheme == "https":
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = True
-            ctx.verify_mode = ssl.CERT_REQUIRED
-            try:
-                sock = ctx.wrap_socket(sock, server_hostname=host)
-            except ssl.SSLError as exc:
-                log.error("Crontinel Agent: SSL handshake failed: %s", exc)
-                self._log(f"SSL handshake failed: {exc}")
-                sock.close()
-                return None
-
-        request = (
-            f"GET {path} HTTP/1.1\r\n"
-            f"Host: {host}\r\n"
-            f"Authorization: Bearer {self.api_key}\r\n"
-            f"Accept: text/event-stream\r\n"
-            f"Cache-Control: no-cache\r\n"
-            f"Connection: keep-alive\r\n"
-            f"User-Agent: crontinel-agent/1.0\r\n"
-            f"\r\n"
-        )
-
-        try:
-            sock.sendall(request.encode())
-        except OSError as exc:
-            log.error("Crontinel Agent: failed to send request: %s", exc)
-            self._log(f"Failed to send request: {exc}")
-            sock.close()
-            return None
-
-        return sock
-
-    def _read_response_headers(self, sock: socket.socket) -> bool:
-        """
-        Read and validate the HTTP response status line and headers.
-
-        Manually reads from the raw socket (no ``makefile`` wrapper)
-        so SSE body data is not lost in a BufferedReader buffer.
-        Any data after the ``\\r\\n\\r\\n`` header boundary is saved
-        in ``self._sse_readahead`` and fed to the parser first.
-
-        Returns ``True`` if the status is 2xx.
-        """
-        buf = b""
-        while b"\r\n\r\n" not in buf:
-            try:
-                chunk = sock.recv(4096)
-            except OSError as exc:
-                self._log(f"Connection closed while reading response: {exc}")
-                return False
-            if not chunk:
-                self._log("Connection closed while reading response.")
-                return False
-            buf += chunk
-
-        # Split at the header/body boundary
-        header_bytes, extra = buf.split(b"\r\n\r\n", 1)
-        header_text = header_bytes.decode("utf-8", errors="replace")
-
-        # Save any extra data for the SSE parser
-        if extra:
-            self._sse_readahead = extra.decode("utf-8", errors="replace")
-
-        lines = header_text.split("\r\n")
-        if not lines:
-            self._log("Empty response headers.")
-            return False
-
-        status_line = lines[0].strip()
-        parts = status_line.split(None, 2)
-        if len(parts) < 2 or not parts[1].startswith("2"):
-            self._log(f"Unexpected response: {status_line}")
-            return False
-
-        return True
-
-    def _read_sse_stream(self, sock: socket.socket) -> None:
-        """
-        Non-blocking read loop on the SSE socket.
-
-        Reads available data, feeds the SSE parser, fires heartbeats,
-        and dispatches signal handlers.
-        """
-        sock.setblocking(False)
-
-        # Feed any readahead from the header parsing phase
-        if self._sse_readahead:
-            self.feed_sse_data(self._sse_readahead)
-            self._sse_readahead = ""
-
-        while self.running:
-            ready = select.select([sock], [], [], STREAM_SELECT_TIMEOUT)
-
-            if not ready[0]:
-                # Timeout — check heartbeats
-                self._check_heartbeat()
-                continue
-
-            try:
-                chunk = sock.recv(8192).decode()
-            except (BlockingIOError, ssl.SSLWantReadError):
-                self._check_heartbeat()
-                continue
-            except OSError:
-                break
-
-            if not chunk:
-                break
-
-            self.feed_sse_data(chunk)
-            self._check_heartbeat()
-
-    # ── SSE Parser ─────────────────────────────────────────────────────────────
-
-    def _feed_line(self, line: str) -> None:
-        """Process a single SSE line (without trailing \\n)."""
-        if line == "":
-            self._dispatch_current_event()
-            self.current_event = None
-            return
-
-        if ":" not in line:
-            return
-
-        field, value = line.split(":", 1)
-        value = value.lstrip()
-
-        if self.current_event is None:
-            self.current_event = SseEvent()
-
-        if field == "event":
-            self.current_event.event = value
-        elif field == "data":
-            self.current_event.data += value
-        elif field == "id":
-            self.current_event.id = value
-
-    def _dispatch_current_event(self) -> None:
-        """Dispatch a complete SSE event."""
-        if self.current_event is None:
-            return
-
-        ev = self.current_event
-        if ev.event == "command" and ev.data:
-            self.handle_command_event(ev.data)
-        elif ev.event == "ping":
-            self._log("Received server ping.")
-
-    def _reset_sse_parser(self) -> None:
-        self.sse_buffer = ""
-        self.current_event = None
-        self._sse_readahead = ""
+            self._http_post(self.api_url + RESULT_PATH, json_body=payload)
+        except Exception as exc:
+            self._log(f"Result report error: {exc}")
 
     # ── Heartbeat ──────────────────────────────────────────────────────────────
 
     def _check_heartbeat(self) -> None:
         """Send a heartbeat if it's due."""
-        if (time.time() - self.last_heartbeat_at) >= HEARTBEAT_INTERVAL:
+        if (time.time() - self.last_heartbeat_at) >= HEARTBEAT_INTERVAL_S:
             self._send_heartbeat()
 
     def _send_heartbeat(self) -> None:
-        """POST a heartbeat to the SaaS."""
+        """POST a heartbeat to the cloud."""
         self.last_heartbeat_at = time.time()
         uptime = int(time.time() - self.started_at)
 
@@ -424,32 +285,92 @@ class Agent:
             self._http_post(
                 url,
                 json_body={
-                    "status": "connected",
-                    "uptime_seconds": uptime,
+                    "agent_id": self._agent_id(),
+                    "metadata": {
+                        "uptime_seconds": uptime,
+                    },
                 },
             )
+            self._log(f"Heartbeat sent (uptime: {uptime}s)")
         except Exception as exc:
-            log.warning("Heartbeat exception: %s", exc)
+            self._log(f"Heartbeat error: {exc}")
 
-    # ── Command Result Reporting ───────────────────────────────────────────────
+    # ── HTTP Helpers ───────────────────────────────────────────────────────────
 
-    def _report_command_result(self, **kwargs: str | int) -> None:
-        """POST a command execution result to the SaaS."""
-        command_id = kwargs.get("command_id", "")
-        url = f"{self.api_url}{COMMAND_RESULT_PATH.format(command_id=command_id)}"
+    def _http_get(self, url: str) -> dict[str, Any] | None:
+        """Low-level HTTP GET with auth."""
+        parsed = urllib.parse.urlparse(url)
+        host = parsed.hostname
+        if not host:
+            return None
+        scheme = parsed.scheme or "https"
+        port = parsed.port or (443 if scheme == "https" else 80)
+        path = parsed.path or "/"
+        if parsed.query:
+            path += "?" + parsed.query
+
+        request = (
+            f"GET {path} HTTP/1.1\r\n"
+            f"Host: {host}\r\n"
+            f"Authorization: Bearer {self.api_key}\r\n"
+            f"Accept: application/json\r\n"
+            f"Connection: close\r\n"
+            f"User-Agent: crontinel-agent/1.0\r\n"
+            f"\r\n"
+        )
+
         try:
-            self._http_post(url, json_body=kwargs)
-        except Exception as exc:
-            log.warning("Exception reporting command result: %s", exc)
+            sock = socket.create_connection((host, port), timeout=HTTP_TIMEOUT_S)
+        except OSError as exc:
+            self._log(f"HTTP GET connect failed: {exc}")
+            return None
 
-    # ── HTTP Helper ────────────────────────────────────────────────────────────
+        try:
+            if scheme == "https":
+                ctx = ssl.create_default_context()
+                ctx.check_hostname = True
+                ctx.verify_mode = ssl.CERT_REQUIRED
+                sock = ctx.wrap_socket(sock, server_hostname=host)
 
-    def _http_post(self, url: str, json_body: dict) -> None:
+            sock.sendall(request.encode())
+
+            response = b""
+            while True:
+                chunk = sock.recv(8192)
+                if not chunk:
+                    break
+                response += chunk
+        except (ssl.SSLError, OSError) as exc:
+            self._log(f"HTTP GET error: {exc}")
+            return None
+        finally:
+            sock.close()
+
+        # Parse response
+        header_end = response.find(b"\r\n\r\n")
+        if header_end == -1:
+            return None
+
+        status_line = response[: response.find(b"\r\n")].decode()
+        body = response[header_end + 4 :]
+
+        parts = status_line.split(None, 2)
+        if len(parts) >= 2 and parts[1].startswith("2"):
+            if body:
+                try:
+                    return json.loads(body.decode())
+                except json.JSONDecodeError:
+                    pass
+        return None
+
+    def _http_post(
+        self, url: str, json_body: dict[str, Any]
+    ) -> dict[str, Any] | None:
         """Low-level HTTP POST with JSON body over a fresh socket."""
         parsed = urllib.parse.urlparse(url)
         host = parsed.hostname
         if not host:
-            return
+            return None
         scheme = parsed.scheme or "https"
         port = parsed.port or (443 if scheme == "https" else 80)
         path = parsed.path or "/"
@@ -467,9 +388,9 @@ class Agent:
         ).encode() + body
 
         try:
-            sock = socket.create_connection((host, port), timeout=10)
+            sock = socket.create_connection((host, port), timeout=HTTP_TIMEOUT_S)
         except OSError:
-            return
+            return None
 
         try:
             if scheme == "https":
@@ -479,28 +400,35 @@ class Agent:
                 sock = ctx.wrap_socket(sock, server_hostname=host)
 
             sock.sendall(request)
-            # Read response (consume headers and body)
-            rfile = sock.makefile("rb")
-            status_line = rfile.readline().decode().strip()
-            status_code = 0
-            if status_line:
-                parts = status_line.split(None, 2)
-                if len(parts) >= 2:
-                    try:
-                        status_code = int(parts[1])
-                    except ValueError:
-                        pass
-            if status_code and status_code not in (200, 201, 202, 204):
-                log.warning(
-                    "HTTP POST %s returned %s", path, status_line
-                )
-            # Drain the rest
-            while rfile.readline():
-                pass
+
+            response = b""
+            while True:
+                chunk = sock.recv(8192)
+                if not chunk:
+                    break
+                response += chunk
         except (ssl.SSLError, OSError) as exc:
             log.warning("HTTP POST %s error: %s", path, exc)
+            return None
         finally:
             sock.close()
+
+        # Parse response
+        header_end = response.find(b"\r\n\r\n")
+        if header_end == -1:
+            return None
+
+        status_line = response[: response.find(b"\r\n")].decode()
+        body_data = response[header_end + 4 :]
+
+        parts = status_line.split(None, 2)
+        if len(parts) >= 2 and parts[1].startswith("2"):
+            if body_data:
+                try:
+                    return json.loads(body_data.decode())
+                except json.JSONDecodeError:
+                    pass
+        return None
 
     # ── Signal Handling ────────────────────────────────────────────────────────
 
@@ -513,6 +441,20 @@ class Agent:
 
         signal.signal(signal.SIGTERM, _shutdown)
         signal.signal(signal.SIGINT, _shutdown)
+
+    # ── Helpers ────────────────────────────────────────────────────────────────
+
+    def _agent_id(self) -> str:
+        return socket.gethostname()
+
+    def _agent_name(self) -> str:
+        return f"python-agent:{self._agent_id()}"
+
+    def _sleep(self, seconds: int) -> None:
+        for _ in range(seconds):
+            if not self.running:
+                break
+            time.sleep(1)
 
     # ── Logging ────────────────────────────────────────────────────────────────
 

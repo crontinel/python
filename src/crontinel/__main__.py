@@ -64,11 +64,13 @@ def _handle_agent(args: argparse.Namespace) -> int:
 
     api_key = os.environ.get("CRONTINEL_API_KEY")
     api_url = os.environ.get("CRONTINEL_API_URL")
+    app_id = os.environ.get("CRONTINEL_APP_ID")
 
     if not api_key:
         print("CRONTINEL_API_KEY is not set.", file=sys.stderr)
         print("", file=sys.stderr)
         print("  export CRONTINEL_API_KEY=your-api-key", file=sys.stderr)
+        print("  export CRONTINEL_APP_ID=your-app-slug", file=sys.stderr)
         print("  export CRONTINEL_API_URL=https://app.crontinel.com (optional)", file=sys.stderr)
         print("", file=sys.stderr)
         print("You can also generate a systemd unit or supervisor config:", file=sys.stderr)
@@ -76,7 +78,15 @@ def _handle_agent(args: argparse.Namespace) -> int:
         print("  crontinel agent --supervisor", file=sys.stderr)
         return 1
 
-    agent = Agent(api_key=api_key, api_url=api_url)
+    if not app_id:
+        print("CRONTINEL_APP_ID is not set.", file=sys.stderr)
+        print("", file=sys.stderr)
+        print("  export CRONTINEL_APP_ID=your-app-slug", file=sys.stderr)
+        print("  (found in app.crontinel.com → Settings → App slug)", file=sys.stderr)
+        print("", file=sys.stderr)
+        return 1
+
+    agent = Agent(api_key=api_key, api_url=api_url, app_id=app_id)
     print(f"Crontinel Agent v{__version__}")
     print("--------------------------")
     print()
