@@ -8,6 +8,7 @@ instead of SSE for simplicity and portability.
 
 from __future__ import annotations
 
+import fnmatch
 import json
 import logging
 import os
@@ -49,6 +50,7 @@ class Agent:
         api_url: str | None = None,
         app_id: str | None = None,
         output_writer: Callable[[str], None] | None = None,
+        allowed_commands: list[str] | None = None,
     ) -> None:
         self.api_key = api_key or os.environ.get("CRONTINEL_API_KEY", "")
         if not self.api_key:
@@ -67,6 +69,20 @@ class Agent:
         self.api_url = base_url.rstrip("/api")  # strip trailing /api if present
         self.output_writer = output_writer or (lambda msg: print(msg))
 
+        # Commands received from the cloud are matched against this allowlist
+        # (fnmatch-style patterns — "*" wildcard; a pattern with no wildcard
+        # matches only that exact command string) before they are ever passed
+        # to the shell. If not given explicitly, falls back to the
+        # comma-separated CRONTINEL_AGENT_ALLOWED_COMMANDS env var.
+        #
+        # SECURITY: an empty/unset allowlist means NO commands are permitted.
+        # This is a fail-closed default — it does NOT mean "allow everything."
+        if allowed_commands is not None:
+            self.allowed_commands = list(allowed_commands)
+        else:
+            env_val = os.environ.get("CRONTINEL_AGENT_ALLOWED_COMMANDS", "")
+            self.allowed_commands = [p.strip() for p in env_val.split(",") if p.strip()]
+
         self.running = True
         self.last_heartbeat_at = time.time()
         self.started_at = time.time()
@@ -84,6 +100,10 @@ class Agent:
         self._log(f"Agent ID: {self._agent_id()}")
         self._log(f"App ID: {self.app_id}")
         self._log(f"API URL: {self.api_url}")
+        if self.allowed_commands:
+            self._log(f"Allowed commands: {len(self.allowed_commands)} pattern(s) configured")
+        else:
+            self._log("Allowed commands: NONE configured — all commands will be rejected")
 
         # Register with the cloud on startup
         self.register()
@@ -163,6 +183,18 @@ class Agent:
 
     # ── Execute + Report ───────────────────────────────────────────────────────
 
+    def _is_command_allowed(self, command: str) -> bool:
+        """
+        Check a command string against the configured allowlist.
+
+        Patterns are fnmatch-style (``*`` wildcard supported; a pattern with
+        no wildcard must match the command exactly). An empty/unset
+        allowlist means NO commands are permitted — fail-closed default.
+        """
+        if not self.allowed_commands:
+            return False
+        return any(fnmatch.fnmatch(command, pattern) for pattern in self.allowed_commands)
+
     def _execute_and_report(self, cmd: dict[str, Any]) -> None:
         """Execute a command and report the result."""
         trigger_id = str(cmd["id"])
@@ -180,6 +212,27 @@ class Agent:
 
         # Acknowledge receipt first
         self._report_result(trigger_id=trigger_id, status="acknowledged")
+
+        if not self._is_command_allowed(command_str):
+            error_message = "Command rejected: not in allowlist"
+            log.warning(
+                "Rejected command [%s]: not in allowlist: %r", trigger_id, command_str
+            )
+            self._log(f"Command [{trigger_id}] rejected: not in allowlist")
+
+            finished_at = datetime.now(timezone.utc)
+            duration_ms = int(time.time() * 1000) - start_ms
+            self._report_result(
+                trigger_id=trigger_id,
+                status="failed",
+                exit_code=-1,
+                output=error_message,
+                error_message=error_message,
+                started_at=started_at.isoformat(),
+                finished_at=finished_at.isoformat(),
+                duration_ms=duration_ms,
+            )
+            return
 
         env_overrides = cmd.get("payload") or {}
         cmd_timeout = 300
