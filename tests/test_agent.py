@@ -155,7 +155,7 @@ def test_fetch_commands_returns_list():
 
 def test_execute_and_report_passes_correct_fields():
     """Command execution passes trigger_id to report."""
-    agent = Agent(api_key="test-key", app_id="test-app")
+    agent = Agent(api_key="test-key", app_id="test-app", allowed_commands=["*"])
     reported = []
 
     def fake_report(**kw):
@@ -183,7 +183,7 @@ def test_execute_and_report_passes_correct_fields():
 
 def test_execute_reports_failure():
     """Non-zero exit command is reported as failed."""
-    agent = Agent(api_key="test-key", app_id="test-app")
+    agent = Agent(api_key="test-key", app_id="test-app", allowed_commands=["*"])
     reported = []
 
     def fake_report(**kw):
@@ -207,7 +207,7 @@ def test_execute_reports_failure():
 
 def test_execute_includes_env_overrides(tmp_path):
     """Env overrides from payload are passed to the subprocess."""
-    agent = Agent(api_key="test-key", app_id="test-app")
+    agent = Agent(api_key="test-key", app_id="test-app", allowed_commands=["*"])
     reported = []
 
     def fake_report(**kw):
@@ -226,6 +226,133 @@ def test_execute_includes_env_overrides(tmp_path):
     assert len(result_reports) == 1
     assert result_reports[0]["status"] == "completed"
     assert "custom" in result_reports[0]["output"]
+
+
+# ── Command Allowlist ────────────────────────────────────────────────────────────
+
+
+def test_allowed_commands_defaults_empty():
+    """Allowlist defaults to empty (fail-closed) when not configured."""
+    with patch.dict(os.environ, {}, clear=True):
+        agent = Agent(api_key="test-key", app_id="test-app")
+        assert agent.allowed_commands == []
+
+
+def test_allowed_commands_from_env_var():
+    """Allowlist falls back to CRONTINEL_AGENT_ALLOWED_COMMANDS env var."""
+    with patch.dict(
+        os.environ,
+        {"CRONTINEL_AGENT_ALLOWED_COMMANDS": "echo hello, systemctl restart *"},
+        clear=True,
+    ):
+        agent = Agent(api_key="test-key", app_id="test-app")
+        assert agent.allowed_commands == ["echo hello", "systemctl restart *"]
+
+
+def test_allowed_commands_explicit_overrides_env():
+    """Explicit allowed_commands takes precedence over the env var."""
+    with patch.dict(
+        os.environ,
+        {"CRONTINEL_AGENT_ALLOWED_COMMANDS": "echo should-not-be-used"},
+        clear=True,
+    ):
+        agent = Agent(api_key="test-key", app_id="test-app", allowed_commands=["ls *"])
+        assert agent.allowed_commands == ["ls *"]
+
+
+def test_is_command_allowed_exact_match():
+    """Exact string patterns match literally."""
+    agent = Agent(api_key="test-key", app_id="test-app", allowed_commands=["echo hello"])
+    assert agent._is_command_allowed("echo hello") is True
+    assert agent._is_command_allowed("echo goodbye") is False
+
+
+def test_is_command_allowed_wildcard_match():
+    """fnmatch-style wildcard patterns are supported."""
+    agent = Agent(api_key="test-key", app_id="test-app", allowed_commands=["systemctl restart *"])
+    assert agent._is_command_allowed("systemctl restart nginx") is True
+    assert agent._is_command_allowed("systemctl stop nginx") is False
+
+
+def test_is_command_allowed_empty_allowlist_rejects_everything():
+    """An empty allowlist rejects any command (fail-closed)."""
+    agent = Agent(api_key="test-key", app_id="test-app")
+    assert agent.allowed_commands == []
+    assert agent._is_command_allowed("echo hello") is False
+    assert agent._is_command_allowed("") is False
+
+
+def test_execute_rejects_command_when_allowlist_empty():
+    """Commands are rejected and reported as failed when the allowlist is empty."""
+    agent = Agent(api_key="test-key", app_id="test-app")
+    reported = []
+
+    def fake_report(**kw):
+        reported.append(kw)
+
+    agent._report_result = fake_report  # type: ignore[assignment]
+
+    with patch("crontinel.agent.subprocess.run") as mock_run:
+        agent._execute_and_report({
+            "id": 99,
+            "command": "rm -rf /",
+            "payload": None,
+            "request_key": None,
+        })
+        mock_run.assert_not_called()
+
+    result_reports = [r for r in reported if r["status"] != "acknowledged"]
+    assert len(result_reports) == 1
+    assert result_reports[0]["status"] == "failed"
+    assert result_reports[0]["error_message"] == "Command rejected: not in allowlist"
+
+
+def test_execute_rejects_command_not_matching_pattern():
+    """Commands not matching any configured pattern are rejected."""
+    agent = Agent(api_key="test-key", app_id="test-app", allowed_commands=["echo hello"])
+    reported = []
+
+    def fake_report(**kw):
+        reported.append(kw)
+
+    agent._report_result = fake_report  # type: ignore[assignment]
+
+    with patch("crontinel.agent.subprocess.run") as mock_run:
+        agent._execute_and_report({
+            "id": 100,
+            "command": "echo goodbye",
+            "payload": None,
+            "request_key": None,
+        })
+        mock_run.assert_not_called()
+
+    result_reports = [r for r in reported if r["status"] != "acknowledged"]
+    assert len(result_reports) == 1
+    assert result_reports[0]["status"] == "failed"
+    assert result_reports[0]["error_message"] == "Command rejected: not in allowlist"
+
+
+def test_execute_allows_command_matching_wildcard_pattern():
+    """Commands matching a wildcard allowlist pattern execute normally."""
+    agent = Agent(api_key="test-key", app_id="test-app", allowed_commands=["echo *"])
+    reported = []
+
+    def fake_report(**kw):
+        reported.append(kw)
+
+    agent._report_result = fake_report  # type: ignore[assignment]
+
+    agent._execute_and_report({
+        "id": 101,
+        "command": "echo hello-world",
+        "payload": None,
+        "request_key": None,
+    })
+
+    result_reports = [r for r in reported if r["status"] != "acknowledged"]
+    assert len(result_reports) == 1
+    assert result_reports[0]["status"] == "completed"
+    assert "hello-world" in result_reports[0]["output"]
 
 
 # ── Heartbeat ────────────────────────────────────────────────────────────────────
