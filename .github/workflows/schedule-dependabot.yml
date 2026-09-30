@@ -1,8 +1,8 @@
 name: Dependency Check
 
+# Keep the legacy dependency diagnostic available on demand.
+# Scheduled maintenance should produce actionable updates before being restored.
 on:
-  schedule:
-    - cron: "0 0 * * 1"
   workflow_dispatch:
 
 jobs:
