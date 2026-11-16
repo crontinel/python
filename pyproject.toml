@@ -1,6 +1,10 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "crontinel"
-version = "0.2.0"
+version = "0.2.1"
 description = "Crontinel monitoring SDK for Python applications"
 readme = "README.md"
 requires-python = ">=3.9"

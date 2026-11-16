@@ -57,6 +57,8 @@ client.event(
 | `CRONTINEL_API_KEY` | — | Your Crontinel API key (required) |
 | `CRONTINEL_API_URL` | `https://app.crontinel.com` | Crontinel SaaS or self-hosted endpoint |
 
+No dependencies are required: the client uses `requests` if it is installed, otherwise the standard library. Calls go to the MCP endpoint (`/api/mcp`) and carry no outcome metrics; to alert when a job finished but did nothing, send the [HTTP check-in receipt](https://docs.crontinel.com/check-in/recipes/) with a count.
+
 ## Cron / heartbeat submission
 
 Use `schedule_run()` when your cron or heartbeat job finishes and you want to submit one monitoring event to Crontinel:
