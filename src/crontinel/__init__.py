@@ -9,7 +9,7 @@ import os
 import time
 from typing import Any, Callable, TypeVar
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 DEFAULT_API_URL = "https://app.crontinel.com"
 
@@ -22,7 +22,7 @@ class Crontinel:
         api_key: Your Crontinel API key (or set CRONTINEL_API_KEY env var).
         api_url: Crontinel API URL. Defaults to https://app.crontinel.com.
         app_name: Name of this application. Defaults to "python".
-        sync: Use the ``requests`` library for HTTP. Set ``False`` to use ``httpx`` if installed.
+        sync: Use ``requests`` if installed, else the standard library. Set ``False`` to use ``httpx``.
     """
 
     def __init__(
@@ -47,11 +47,27 @@ class Crontinel:
             "params": params,
         }
 
-        if self.sync:
-            try:
-                import requests
-            except ImportError:
-                raise ImportError("Install crontinel with httpx: pip install 'crontinel[httpx]'")
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}",
+            "User-Agent": f"crontinel-python:{__version__}",
+        }
+        try:
+            import requests
+        except ImportError:
+            requests = None
+
+        if self.sync and requests is None:
+            # No optional HTTP library installed: use the standard library.
+            import json
+            import urllib.request
+
+            req = urllib.request.Request(
+                f"{self.api_url}/api/mcp", data=json.dumps(payload).encode(), headers=headers, method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:  # raises HTTPError on 4xx/5xx
+                data = json.loads(resp.read())
+        elif self.sync:
             resp = requests.post(
                 f"{self.api_url}/api/mcp",
                 json=payload,

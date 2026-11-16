@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.2.1] - 2026-11-16
+
+- Fix: a plain `pip install crontinel` failed on the first call because the default client needs `requests`, which is not a dependency. It now falls back to the standard library when neither `requests` nor `httpx` is installed.
+- Declare the setuptools build backend in `pyproject.toml`.
+- First release on PyPI.
+
 ## v0.1.0 (2026-04-13)
 
 First release on PyPI.

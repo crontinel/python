@@ -141,3 +141,35 @@ class TestCrontinelAsync:
     def test_async_init(self):
         c = Crontinel(api_key="test", sync=False)
         assert c.sync is False
+
+class TestStdlibFallback:
+    def test_uses_urllib_when_requests_is_missing(self, monkeypatch):
+        import io
+        import json
+        import sys
+        import urllib.request
+
+        from crontinel import Crontinel
+
+        monkeypatch.setitem(sys.modules, "requests", None)  # makes `import requests` raise ImportError
+        seen = {}
+
+        class Resp(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        def fake_urlopen(req, timeout):
+            seen["url"], seen["auth"] = req.full_url, req.get_header("Authorization")
+            seen["body"] = json.loads(req.data)
+            return Resp(b'{"jsonrpc":"2.0","result":{"ok":true}}')
+
+        monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+        Crontinel(api_key="k").schedule_run("nightly", duration_ms=5, exit_code=0)
+
+        assert seen["url"] == "https://app.crontinel.com/api/mcp"
+        assert seen["auth"] == "Bearer k"
+        assert seen["body"]["method"] == "notify/schedule_run"
+        assert seen["body"]["params"]["command"] == "nightly"
